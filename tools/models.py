@@ -1,5 +1,6 @@
 import discord
 import config
+import logging
 import traceback
 
 from typing import (
@@ -10,6 +11,7 @@ from typing import (
 from discord.ext import commands
 from config import settings, cogs
 from enum import IntEnum
+from dataclasses import dataclass
 # from tools import db
 
 NC_CATEGORIES = Literal[
@@ -31,14 +33,19 @@ NC_CATEGORIES = Literal[
 SDC_URL = "https://api.server-discord.com/v2/bots/{bot_id}/stats"
 
 class MadBot(commands.AutoShardedBot):
+    logger: logging.Logger
+
     def __init__(self):
         super().__init__(
-            command_prefix=commands.when_mentioned_or(settings['prefix']),
+            command_prefix=commands.when_mentioned_or(settings['prefix']), # type: ignore
             intents=settings['intents'],
             help_command=None,
             application_id=settings["bot_id"],
             shard_count=settings['shard_count']
         )
+        logger = logging.getLogger("discord.ext.commands.bot")
+        logger.name = "MadBot"
+        self.logger = logger
     
     async def is_owner(self, user: discord.User):
         if user.id in config.coders:
@@ -51,11 +58,13 @@ class MadBot(commands.AutoShardedBot):
             try:
                 await self.load_extension(ext)
             except Exception as err:
-                print(f"=============\nERROR WHILE LOADING COG {ext}!!!")
-                traceback.print_exc()
-                print("=============")
+                self.logger.error(
+                    f"Error has occured while loading {ext} cog:\n"
+                    f"{traceback.format_exc()}\n"
+                    f"==========================================="
+                )
             else:
-                print(f"Cog \"{ext}\" запущен!")
+                self.logger.info(f"Cog \"{ext}\" loaded!")
 
 class BlackList:
     def __init__(
@@ -74,9 +83,13 @@ class BlackList:
     #     return db.remove_blacklist(self.user_id)
 
 class GuildItem:
+    """Guild item object.
+    
+    ID can be None if this is partial object (not created in DB)"""
+
     def __init__(
         self,
-        id: int,
+        id: int | None,
         guild_id: int,
         name: str,
         cost: int,
@@ -94,14 +107,24 @@ class GuildItem:
     def from_dict(cls, guild_id: int, data: dict):
         self = cls.__new__(cls)
 
-        self.id = data['id']
+        self.id = data.get('id')
         self.guild_id = guild_id
         self.name = data['name']
         self.cost = data['cost']
         self.description = data['description']
-        self.req_role = int(data['req_role'])
+        if data.get('req_role') is not None:
+            self.req_role = int(data['req_role'])
+        else:
+            self.req_role = None
 
         return self
+
+    def to_dict(self):
+        dct: dict = self.__dict__
+        dct.pop("guild_id")
+        if self.req_role is None: dct['req_role'] = None
+        else: dct['req_role'] = str(self.req_role)
+        return dct
 
 class GuildUser:
     def __init__(
@@ -120,6 +143,17 @@ class GuildUser:
         self.level = level
         self.inventory = inventory
 
+    @classmethod
+    def from_dict(cls, data: dict, guild_id: int):
+        self = cls.__new__(cls)
+        self.guild_id = guild_id
+        self.user_id = int(data['user_id'])
+        self.balance = data['balance']
+        self.xp = data['xp']
+        self.level = data['level']
+        self.inventory = [GuildItem.from_dict(guild_id, item) for item in data['inventory']]
+        return self
+
 class GuildActionsType(IntEnum):    
     PATCH_MONEY = 1
     TRANSFER = 2
@@ -137,8 +171,10 @@ class EditMoneyAction:
 
     def to_dict(self):
         dct = self.__dict__
-        dct['user_id'] = str(dct['user_id'])
-        dct.pop('guild_id')
+        if dct.get('user_id') is not None:
+            dct['user_id'] = str(dct['user_id'])
+        if dct.get('guild_id') is not None:
+            dct.pop('guild_id')
         return dct
 
 class PatchMoneyAction(EditMoneyAction):
@@ -158,6 +194,11 @@ class PatchMoneyAction(EditMoneyAction):
             reason, 
             amount
         )
+    
+    def to_dict(self):
+        dct = super().to_dict()
+        dct['patcher_id'] = str(dct['patcher_id'])
+        return dct
 
 class TransferAction(EditMoneyAction):
     def __init__(
@@ -168,6 +209,8 @@ class TransferAction(EditMoneyAction):
         reason: Optional[str], 
         amount: int
     ):
+        self.from_id = from_id
+        self.to_id = to_id
         super().__init__(
             GuildActionsType.TRANSFER, 
             guild_id, 
@@ -176,8 +219,12 @@ class TransferAction(EditMoneyAction):
             amount
         )
         self.__delattr__("user_id")
-        self.from_id = from_id
-        self.to_id = to_id
+    
+    def to_dict(self):
+        dct = super().to_dict()
+        dct['from_id'] = str(dct['from_id'])
+        dct['to_id'] = str(dct['to_id'])
+        return dct
 
 class BuyAction(EditMoneyAction):
     def __init__(
@@ -204,7 +251,7 @@ class UserWarn:
         user_id: int,
         mod_id: int,
         until: int,
-        reason: int
+        reason: str
     ):
         self.id = GuildActionsType.WARN
         self.guild_id = guild_id
@@ -225,7 +272,7 @@ class UserUnwarn(UserWarn):
         guild_id: int, 
         user_id: int, 
         mod_id: int, 
-        reason: int
+        reason: str
     ):
         super().__init__(
             guild_id, 
@@ -235,3 +282,46 @@ class UserUnwarn(UserWarn):
             reason
         )
         self.__delattr__("until")
+
+class ButtonRole:
+    def __init__(
+        self,
+        channel_id: int,
+        message_id: int,
+        type: Literal["single", "multiple"],
+        roles: List[int]
+    ):
+        self.channel_id = channel_id
+        self.message_id = message_id
+        self.type = type
+        self.roles = roles
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        self = cls.__new__(cls)
+        self.channel_id = str(data['channel_id'])
+        self.message_id = str(data['message_id'])
+        self.type = data['type']
+        self.roles = [int(role) for role in data['roles']]
+        return self
+    
+    def to_dict(self):
+        dct = self.__dict__
+        dct["channel_id"] = str(dct['channel_id'])
+        dct["message_id"] = str(dct['message_id'])
+        dct["roles"] = [str(role) for role in dct["roles"]]
+
+class BotGuild:
+    def __init__(
+        self,
+        guild_id: int,
+        members: List[GuildUser],
+        items: List[GuildItem],
+        autoroles: List[int],
+        buttonroles: List[ButtonRole]
+    ):
+        self.guild_id = guild_id
+        self.members = members
+        self.items = items
+        self.autoroles = autoroles
+        self.buttonroles = buttonroles
